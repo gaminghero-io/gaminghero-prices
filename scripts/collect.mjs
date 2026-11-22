@@ -70,19 +70,18 @@ async function collectRegion(region, names) {
   const idx = await api(region, '/data/wow/ruleset/index', ns);
   const rulesets = (idx && idx.rulesets) || [];
   console.log(region, 'rulesets:', rulesets.map(r => r.id + ':' + (r.name?.en_GB || r.name)).join(', '));
-  // Debug: what Blizzard says about each ruleset (helps map auction houses to rulesets)
-  for (const r of rulesets) { const dd = await api(region, `/data/wow/ruleset/${r.id}`, ns); console.log('RULESET', r.id, JSON.stringify(dd).slice(0, 600)); }
   // Ruleset currently does not filter auctions (same houses under every ruleset), so read one.
   const rs = (rulesets.find(r => r.id === 2) || rulesets[0])?.id;
   if (!rs) throw new Error('No rulesets for ' + region);
   const hidx = await api(region, `/data/wow/ruleset/${rs}/auctions/`, ns);
   const houses = (hidx && hidx.auctions) || [];
-  console.log(region, 'houses:', houses.length, 'first entry:', JSON.stringify(houses[0]).slice(0, 400));
+  console.log(region, 'houses:', houses.length);
   const hmap = ((await readJson('data/house-map.json', {}))[region]) || {};
 
   const per = {}; // rulesetId -> itemId -> {a:[], h:[], n:[]}
   const seen = {}; // itemId -> listing count (for name lookup priority)
   const rsNames = Object.fromEntries(rulesets.map(r => [String(r.id), typeof r.name === 'string' ? r.name : (r.name?.en_GB || r.name?.en_US || String(r.id))]));
+  rsNames.all = 'All rulesets';
   let rows = 0;
   for (const h of houses) {
     const hid = h.id ?? (h.key?.href && new URL(h.key.href).pathname.split('/').pop());
@@ -91,20 +90,20 @@ async function collectRegion(region, names) {
     const detail = await api(region, `/data/wow/ruleset/${rs}/auctions/${hid}`, ns);
     if (!detail) continue;
     const rr = detail.ruleset;
-    if (hid == houses[0].id) console.log('HOUSE DETAIL KEYS', Object.keys(detail).join(','), JSON.stringify(rr || null).slice(0, 300));
     const rid = String(hmap[hid] ?? (rr == null ? 'x' + hid : (typeof rr === 'object' ? (rr.id ?? (rr.key?.href ? new URL(rr.key.href).pathname.split('/').pop() : 'x' + hid)) : rr)));
     const P = (per[rid] ||= {});
+    const add = (id, row) => { ((P[id] ||= { a: [], h: [], n: [] })[t]).push(row); seen[id] = (seen[id] || 0) + 1; };
     let items = await listOrLink(region, detail.auctions, ns);
     let comm = Array.isArray(detail.commodities) ? detail.commodities : null;
     if (!comm) { const c = await api(region, `/data/wow/ruleset/${rs}/auctions/${hid}/commodities`, ns); comm = (c && c.auctions) || []; }
     for (const a of items) {
       if (!a.buyout || !a.item) continue;
       const q = a.quantity || 1;
-      ((P[a.item.id] ||= { a: [], h: [], n: [] })[t]).push([Math.round(a.buyout / q), q]); seen[a.item.id] = (seen[a.item.id] || 0) + 1;
+      add(a.item.id, [Math.round(a.buyout / q), q]);
     }
     for (const a of comm) {
       if (!a.unit_price || !a.item) continue;
-      ((P[a.item.id] ||= { a: [], h: [], n: [] })[t]).push([a.unit_price, a.quantity || 1]); seen[a.item.id] = (seen[a.item.id] || 0) + 1;
+      add(a.item.id, [a.unit_price, a.quantity || 1]);
     }
     rows += items.length + comm.length;
     console.log(`  house ${hid} ${hname} (ruleset ${rid} ${rsNames[rid] || ''}): ${items.length} auctions, ${comm.length} commodities`);
@@ -130,6 +129,18 @@ async function collectRegion(region, names) {
       o2[id] = o;
     }
   }
+  // 'all' = every live ruleset combined: each ruleset's market price weighted by how much it has listed.
+  // (Hardcore 'hc' houses are empty and left out.)
+  const all = {};
+  for (const [rid, its] of Object.entries(out)) {
+    if (rid === 'hc') continue;
+    for (const [id, o] of Object.entries(its)) for (const [t, st] of Object.entries(o)) {
+      const x = ((all[id] ||= {})[t] ||= { min: Infinity, w: 0, wm: 0, qty: 0, n: 0 });
+      x.min = Math.min(x.min, st.min); x.wm += st.mkt * st.qty; x.w += st.med * st.qty; x.qty += st.qty; x.n += st.n;
+    }
+  }
+  for (const o of Object.values(all)) for (const [t, x] of Object.entries(o)) o[t] = { min: x.min, mkt: Math.round(x.wm / x.qty), med: Math.round(x.w / x.qty), qty: x.qty, n: x.n };
+  out.all = all;
   return { rows, houses: houses.length, rulesets: out, rsNames };
 }
 
@@ -143,6 +154,7 @@ async function main() {
       const r = await collectRegion(region, names);
       const index = [];
       for (const [rid, its] of Object.entries(r.rulesets)) {
+        if (!Object.keys(its).length) continue;
         const items = {};
         for (const [id, o] of Object.entries(its)) items[id] = { name: names[id] || '', ...o };
         const base = `data/forever-${region}-r${rid}`;
