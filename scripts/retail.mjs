@@ -150,7 +150,11 @@ async function collectRegion(region, list, ids) {
     for (const [k, id] of cands) {
       if (k === 'i' && comm[id]) { const m = market(comm[id]); const c = { p: m.p, n: m.qty, s: 'c', id }; if (!best || best.s !== 'c' || c.n > best.n) best = c; continue; }
       const arr = realmMin[k + id];
-      if (arr && arr.length && (!best || best.s !== 'c')) { const c = { p: median(arr.slice()), n: arr.length, s: k === 'p' ? 'pet' : 'r', id }; if (!best || c.n > best.n) best = c; }
+      if (arr && arr.length && (!best || best.s !== 'c')) {
+        const srt = arr.slice().sort((x, y) => x - y), pc = f => srt[Math.min(srt.length - 1, Math.floor(srt.length * f))];
+        const c = { p: median(arr.slice()), n: arr.length, s: k === 'p' ? 'pet' : 'r', id, q: [pc(0.1), pc(0.25), pc(0.5)] };
+        if (!best || c.n > best.n) best = c;
+      }
     }
     if (best) out[norm(raw)] = best;
   }
