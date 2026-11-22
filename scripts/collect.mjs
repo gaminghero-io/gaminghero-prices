@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 
 const REGIONS = (process.env.REGIONS || 'eu,us').split(',');
 const ID = process.env.BLIZZ_ID, SECRET = process.env.BLIZZ_SECRET;
-const MAX_NAME_LOOKUPS = 600;           // new item names to resolve per run (per region)
+const MAX_NAME_LOOKUPS = 1500;          // new item names to resolve per run (per region), busiest items first
 const HISTORY_DAYS = 45;
 if (!ID || !SECRET) { console.error('Missing BLIZZ_ID / BLIZZ_SECRET'); process.exit(1); }
 
@@ -77,7 +77,9 @@ async function collectRegion(region, names) {
   const houses = (hidx && hidx.auctions) || [];
   console.log(region, 'houses:', houses.length);
 
-  const per = {}; // itemId -> {a:[], h:[], n:[]}
+  const per = {}; // rulesetId -> itemId -> {a:[], h:[], n:[]}
+  const seen = {}; // itemId -> listing count (for name lookup priority)
+  const rsNames = Object.fromEntries(rulesets.map(r => [String(r.id), typeof r.name === 'string' ? r.name : (r.name?.en_GB || r.name?.en_US || String(r.id))]));
   let rows = 0;
   for (const h of houses) {
     const hid = h.id ?? (h.key?.href && new URL(h.key.href).pathname.split('/').pop());
@@ -85,41 +87,46 @@ async function collectRegion(region, names) {
     const t = houseType(hname);
     const detail = await api(region, `/data/wow/ruleset/${rs}/auctions/${hid}`, ns);
     if (!detail) continue;
+    const rr = detail.ruleset;
+    const rid = String(rr == null ? 'x' + hid : (typeof rr === 'object' ? (rr.id ?? (rr.key?.href ? new URL(rr.key.href).pathname.split('/').pop() : 'x' + hid)) : rr));
+    const P = (per[rid] ||= {});
     let items = await listOrLink(region, detail.auctions, ns);
     let comm = Array.isArray(detail.commodities) ? detail.commodities : null;
     if (!comm) { const c = await api(region, `/data/wow/ruleset/${rs}/auctions/${hid}/commodities`, ns); comm = (c && c.auctions) || []; }
     for (const a of items) {
       if (!a.buyout || !a.item) continue;
       const q = a.quantity || 1;
-      ((per[a.item.id] ||= { a: [], h: [], n: [] })[t]).push([Math.round(a.buyout / q), q]);
+      ((P[a.item.id] ||= { a: [], h: [], n: [] })[t]).push([Math.round(a.buyout / q), q]); seen[a.item.id] = (seen[a.item.id] || 0) + 1;
     }
     for (const a of comm) {
       if (!a.unit_price || !a.item) continue;
-      ((per[a.item.id] ||= { a: [], h: [], n: [] })[t]).push([a.unit_price, a.quantity || 1]);
+      ((P[a.item.id] ||= { a: [], h: [], n: [] })[t]).push([a.unit_price, a.quantity || 1]); seen[a.item.id] = (seen[a.item.id] || 0) + 1;
     }
     rows += items.length + comm.length;
-    console.log(`  house ${hid} ${hname}: ${items.length} auctions, ${comm.length} commodities`);
+    console.log(`  house ${hid} ${hname} (ruleset ${rid} ${rsNames[rid] || ''}): ${items.length} auctions, ${comm.length} commodities`);
     await sleep(250);
   }
 
   // Resolve names for new items
-  const missing = Object.keys(per).filter(id => !(id in names)).slice(0, MAX_NAME_LOOKUPS);
+  const missing = Object.keys(seen).filter(id => !(id in names)).sort((x, y) => seen[y] - seen[x]).slice(0, MAX_NAME_LOOKUPS);
   for (const id of missing) {
     let j = await api(region, `/data/wow/item/${id}`, `static-forever-${region}`);
     if (!j) j = await api(region, `/data/wow/item/${id}`, `static-classic1x-${region}`);
-    if (!j) j = await api(region, `/data/wow/item/${id}`, `static-${region}`);
     const nm = j && (typeof j.name === 'string' ? j.name : (j.name?.en_GB || j.name?.en_US));
     names[id] = nm || '';
-    await sleep(30);
+    await sleep(15);
   }
 
   const out = {};
-  for (const [id, f] of Object.entries(per)) {
-    const o = {};
-    for (const t of ['a', 'h', 'n']) if (f[t].length) o[t] = stats(f[t]);
-    out[id] = o;
+  for (const [rid, P] of Object.entries(per)) {
+    const o2 = (out[rid] = {});
+    for (const [id, f] of Object.entries(P)) {
+      const o = {};
+      for (const t of ['a', 'h', 'n']) if (f[t].length) o[t] = stats(f[t]);
+      o2[id] = o;
+    }
   }
-  return { rows, houses: houses.length, items: out };
+  return { rows, houses: houses.length, rulesets: out, rsNames };
 }
 
 async function main() {
@@ -130,24 +137,31 @@ async function main() {
   for (const region of REGIONS) {
     try {
       const r = await collectRegion(region, names);
-      const items = {};
-      for (const [id, o] of Object.entries(r.items)) items[id] = { name: names[id] || '', ...o };
-      await fs.writeFile(`data/forever-${region}.json`, JSON.stringify({ updated: now.toISOString(), region, game: 'forever', houses: r.houses, listings: r.rows, items }));
-      // Daily history: one market price per item per faction, kept for HISTORY_DAYS
-      const hist = await readJson(`data/forever-${region}-history.json`, { days: [], items: {} });
-      if (hist.days[hist.days.length - 1] !== day) {
-        hist.days.push(day);
-        for (const [id, o] of Object.entries(r.items)) {
-          const row = (hist.items[id] ||= []);
-          while (row.length < hist.days.length - 1) row.push(null);
-          const best = o.a || o.h || o.n;
-          row.push([o.a?.mkt ?? null, o.h?.mkt ?? null, o.n?.mkt ?? null, best?.qty ?? 0]);
+      const index = [];
+      for (const [rid, its] of Object.entries(r.rulesets)) {
+        const items = {};
+        for (const [id, o] of Object.entries(its)) items[id] = { name: names[id] || '', ...o };
+        const base = `data/forever-${region}-r${rid}`;
+        await fs.writeFile(`${base}.json`, JSON.stringify({ updated: now.toISOString(), region, game: 'forever', ruleset: rid, rulesetName: r.rsNames[rid] || '', items }));
+        index.push({ id: rid, name: r.rsNames[rid] || '', items: Object.keys(items).length });
+        // Daily history: one market price per item per faction, kept for HISTORY_DAYS
+        const hist = await readJson(`${base}-history.json`, { days: [], items: {} });
+        if (hist.days[hist.days.length - 1] !== day) {
+          hist.days.push(day);
+          for (const [id, o] of Object.entries(its)) {
+            const row = (hist.items[id] ||= []);
+            while (row.length < hist.days.length - 1) row.push(null);
+            const best = o.a || o.h || o.n;
+            row.push([o.a?.mkt ?? null, o.h?.mkt ?? null, o.n?.mkt ?? null, best?.qty ?? 0]);
+          }
+          for (const row of Object.values(hist.items)) while (row.length < hist.days.length) row.push(null);
+          while (hist.days.length > HISTORY_DAYS) { hist.days.shift(); for (const row of Object.values(hist.items)) row.shift(); }
+          await fs.writeFile(`${base}-history.json`, JSON.stringify(hist));
         }
-        for (const row of Object.values(hist.items)) while (row.length < hist.days.length) row.push(null);
-        while (hist.days.length > HISTORY_DAYS) { hist.days.shift(); for (const row of Object.values(hist.items)) row.shift(); }
-        await fs.writeFile(`data/forever-${region}-history.json`, JSON.stringify(hist));
+        console.log(`${region} ruleset ${rid} ${r.rsNames[rid] || ''}: ${Object.keys(items).length} items`);
       }
-      console.log(`${region}: ${Object.keys(items).length} items from ${r.rows} listings`);
+      await fs.writeFile(`data/forever-${region}-index.json`, JSON.stringify({ updated: now.toISOString(), rulesets: index }));
+      console.log(`${region}: ${r.rows} listings`);
     } catch (e) {
       console.error(`${region} failed:`, e.message);
       process.exitCode = 1;
