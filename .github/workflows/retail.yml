@@ -1,0 +1,35 @@
+name: Collect Retail prices
+on:
+  schedule:
+    - cron: '41 */3 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: retail-prices
+  cancel-in-progress: false
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Collect Retail prices
+        env:
+          BLIZZ_ID: ${{ secrets.BLIZZ_ID }}
+          BLIZZ_SECRET: ${{ secrets.BLIZZ_SECRET }}
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: node scripts/retail.mjs
+      - name: Save data
+        if: always()
+        run: |
+          git config user.name "gaminghero-prices-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/retail-*.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Retail prices $(date -u +'%Y-%m-%d %H:%M')"
+          for i in 1 2 3 4 5; do git pull --rebase -X theirs && git push && exit 0; sleep 5; done
+          exit 1
