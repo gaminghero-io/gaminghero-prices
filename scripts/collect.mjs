@@ -70,12 +70,15 @@ async function collectRegion(region, names) {
   const idx = await api(region, '/data/wow/ruleset/index', ns);
   const rulesets = (idx && idx.rulesets) || [];
   console.log(region, 'rulesets:', rulesets.map(r => r.id + ':' + (r.name?.en_GB || r.name)).join(', '));
+  // Debug: what Blizzard says about each ruleset (helps map auction houses to rulesets)
+  for (const r of rulesets) { const dd = await api(region, `/data/wow/ruleset/${r.id}`, ns); console.log('RULESET', r.id, JSON.stringify(dd).slice(0, 600)); }
   // Ruleset currently does not filter auctions (same houses under every ruleset), so read one.
   const rs = (rulesets.find(r => r.id === 2) || rulesets[0])?.id;
   if (!rs) throw new Error('No rulesets for ' + region);
   const hidx = await api(region, `/data/wow/ruleset/${rs}/auctions/`, ns);
   const houses = (hidx && hidx.auctions) || [];
-  console.log(region, 'houses:', houses.length);
+  console.log(region, 'houses:', houses.length, 'first entry:', JSON.stringify(houses[0]).slice(0, 400));
+  const hmap = ((await readJson('data/house-map.json', {}))[region]) || {};
 
   const per = {}; // rulesetId -> itemId -> {a:[], h:[], n:[]}
   const seen = {}; // itemId -> listing count (for name lookup priority)
@@ -88,7 +91,8 @@ async function collectRegion(region, names) {
     const detail = await api(region, `/data/wow/ruleset/${rs}/auctions/${hid}`, ns);
     if (!detail) continue;
     const rr = detail.ruleset;
-    const rid = String(rr == null ? 'x' + hid : (typeof rr === 'object' ? (rr.id ?? (rr.key?.href ? new URL(rr.key.href).pathname.split('/').pop() : 'x' + hid)) : rr));
+    if (hid == houses[0].id) console.log('HOUSE DETAIL KEYS', Object.keys(detail).join(','), JSON.stringify(rr || null).slice(0, 300));
+    const rid = String(hmap[hid] ?? (rr == null ? 'x' + hid : (typeof rr === 'object' ? (rr.id ?? (rr.key?.href ? new URL(rr.key.href).pathname.split('/').pop() : 'x' + hid)) : rr)));
     const P = (per[rid] ||= {});
     let items = await listOrLink(region, detail.auctions, ns);
     let comm = Array.isArray(detail.commodities) ? detail.commodities : null;
