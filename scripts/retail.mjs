@@ -8,7 +8,7 @@ import fs from 'node:fs/promises';
 
 const REGIONS = (process.env.REGIONS || 'eu,us').split(',');
 const ID = process.env.BLIZZ_ID, SECRET = process.env.BLIZZ_SECRET;
-const MAX_LOOKUPS = 400;     // new item names to resolve per run
+const MAX_LOOKUPS = 800;     // item names to look up per run
 const REALM_CONCURRENCY = 6;
 const PET_CAGE = 82800;
 if (!ID || !SECRET) { console.error('Missing BLIZZ_ID / BLIZZ_SECRET'); process.exit(1); }
@@ -42,39 +42,48 @@ async function api(region, path, ns, extra = '', tries = 4) {
       await sleep(2000 * (i + 1));
     }
   }
-  return null;
+  return undefined; // still failing after retries
 }
 const nameOf = n => (typeof n === 'string' ? n : (n?.en_GB || n?.en_US || ''));
 
 // ---------- name -> id resolution (cached in data/retail-ids.json) ----------
+// Each entry: { v: 2, ids: [item ids], pet: species id or null, at: time looked up }.
+// Names that were not found are retried after a few days (the API search sometimes misses).
 const TIER = { copper: 0, silver: 1, gold: 2 };
+const RETRY_MISSING_MS = 3 * 864e5;
+async function searchItem(base) {
+  const want = norm(base);
+  let hits = [];
+  for (let page = 1; page <= 6; page++) {
+    const j = await api('eu', '/data/wow/search/item', 'static-eu', `&name.en_US=${encodeURIComponent(base)}&orderby=id&_pageSize=1000&_page=${page}`);
+    if (j === undefined) return undefined; // API trouble: try again next run
+    if (!j || !j.results) break;
+    for (const r of j.results) { const d = r.data; if (norm(nameOf(d.name)) === want) hits.push(d.id); }
+    if (page >= (j.pageCount || 1)) break;
+  }
+  return hits.sort((a, b) => a - b);
+}
 async function resolveNames(list, ids) {
-  let pets = null;
-  let done = 0;
+  let pets = null, done = 0;
+  const pj = await api('eu', '/data/wow/pet/index', 'static-eu');
+  pets = {};
+  for (const p of (pj && pj.pets) || []) pets[norm(nameOf(p.name))] = p.id;
   for (const raw of list) {
-    const key = norm(raw);
-    if (ids[key] || done >= MAX_LOOKUPS) continue;
+    const key = norm(raw), cur = ids[key];
+    const fresh = cur && cur.v === 2 && (cur.ids.length || cur.pet || Date.now() - (cur.at || 0) < RETRY_MISSING_MS);
+    if (fresh || done >= MAX_LOOKUPS) continue;
     done++;
     let base = raw, tier = null;
     const m = raw.match(/^(.*)\((copper|silver|gold)\)\s*$/i);
     if (m) { base = m[1].trim(); tier = TIER[m[2].toLowerCase()]; }
-    const want = norm(base);
-    const j = await api('eu', '/data/wow/search/item', 'static-eu', `&name.en_GB=${encodeURIComponent(base)}&orderby=id&_pageSize=100`);
-    let hits = ((j && j.results) || []).map(r => r.data).filter(d => norm(nameOf(d.name)) === want).map(d => d.id).sort((a, b) => a - b);
-    if (hits.length) {
-      if (tier !== null) hits = [hits[Math.min(tier, hits.length - 1)]];
-      ids[key] = { t: 'item', ids: hits };
-    } else {
-      if (!pets) {
-        const pj = await api('eu', '/data/wow/pet/index', 'static-eu');
-        pets = {};
-        for (const p of (pj && pj.pets) || []) pets[norm(nameOf(p.name))] = p.id;
-      }
-      ids[key] = pets[want] ? { t: 'pet', ids: [pets[want]] } : { t: 'none', ids: [] };
-    }
-    await sleep(40);
+    let hits = await searchItem(base);
+    if (hits === undefined) { done--; continue; }
+    if (tier !== null && hits.length) hits = [hits[Math.min(tier, hits.length - 1)]];
+    ids[key] = { v: 2, ids: hits, pet: pets[norm(base)] || null, at: Date.now() };
+    await sleep(30);
   }
-  console.log('resolved', done, 'new names');
+  const miss = list.filter(n => { const r = ids[norm(n)]; return r && !r.ids.length && !r.pet; });
+  console.log('resolved', done, 'names;', miss.length, 'not found:', miss.join(' | '));
 }
 
 // ---------- price collection ----------
@@ -91,7 +100,7 @@ function market(rows) {
 async function collectRegion(region, list, ids) {
   const ns = `dynamic-${region}`;
   const itemIds = new Set(), petIds = new Set();
-  for (const raw of list) { const r = ids[norm(raw)]; if (!r) continue; for (const id of r.ids) (r.t === 'pet' ? petIds : itemIds).add(id); }
+  for (const raw of list) { const r = ids[norm(raw)]; if (!r) continue; for (const id of r.ids || []) itemIds.add(id); if (r.pet) petIds.add(r.pet); }
 
   // 1) commodities, region wide
   const comm = {};
@@ -134,12 +143,14 @@ async function collectRegion(region, list, ids) {
   // 3) one price per guide item name
   const out = {};
   for (const raw of list) {
-    const r = ids[norm(raw)]; if (!r || !r.ids.length) continue;
+    const r = ids[norm(raw)]; if (!r) continue;
     let best = null;
-    for (const id of r.ids) {
-      if (r.t === 'item' && comm[id]) { const m = market(comm[id]); const c = { p: m.p, n: m.qty, s: 'c', id }; if (!best || c.n > best.n) best = c; continue; }
-      const arr = realmMin[(r.t === 'pet' ? 'p' : 'i') + id];
-      if (arr && arr.length) { const c = { p: median(arr.slice()), n: arr.length, s: 'r', id }; if (!best || c.n > best.n) best = c; }
+    const cands = (r.ids || []).map(id => ['i', id]);
+    if (r.pet) cands.push(['p', r.pet]);
+    for (const [k, id] of cands) {
+      if (k === 'i' && comm[id]) { const m = market(comm[id]); const c = { p: m.p, n: m.qty, s: 'c', id }; if (!best || best.s !== 'c' || c.n > best.n) best = c; continue; }
+      const arr = realmMin[k + id];
+      if (arr && arr.length && (!best || best.s !== 'c')) { const c = { p: median(arr.slice()), n: arr.length, s: k === 'p' ? 'pet' : 'r', id }; if (!best || c.n > best.n) best = c; }
     }
     if (best) out[norm(raw)] = best;
   }
