@@ -107,10 +107,10 @@ async function collectRegion(region, list, ids) {
   const cj = await api(region, '/data/wow/auctions/commodities', ns);
   for (const a of (cj && cj.auctions) || []) {
     const id = a.item && a.item.id;
-    if (!itemIds.has(id) || !a.unit_price) continue;
+    if (!id || !a.unit_price) continue; // keep every commodity (for the live AH search)
     (comm[id] ||= []).push([a.unit_price, a.quantity || 1]);
   }
-  console.log(region, 'commodities tracked:', Object.keys(comm).length);
+  console.log(region, 'commodities listed:', Object.keys(comm).length);
 
   // 2) every connected realm: cheapest listing of each tracked item / pet
   const idx = await api(region, '/data/wow/connected-realm/index', ns);
@@ -130,8 +130,8 @@ async function collectRegion(region, list, ids) {
         const it = a.item; if (!it) continue;
         const price = a.buyout ? Math.round(a.buyout / (a.quantity || 1)) : a.unit_price; if (!price) continue;
         let key = null;
-        if (it.id === PET_CAGE && it.pet_species_id) { if (petIds.has(it.pet_species_id)) key = 'p' + it.pet_species_id; }
-        else if (itemIds.has(it.id) && !comm[it.id]) key = 'i' + it.id;
+        if (it.id === PET_CAGE && it.pet_species_id) key = 'p' + it.pet_species_id;
+        else if (!comm[it.id]) key = 'i' + it.id; // every realm item (for the live AH search)
         if (key && (!best[key] || price < best[key])) best[key] = price;
       }
       for (const [k, v] of Object.entries(best)) (realmMin[k] ||= []).push(v);
@@ -158,7 +158,15 @@ async function collectRegion(region, list, ids) {
     }
     if (best) out[norm(raw)] = best;
   }
-  return { realms: ok, items: out };
+  // 4) every item in the region, for the live AH search: commodities = market price, realm items / pets = median of each realm's cheapest
+  const all = { c: {}, r: {}, p: {} };
+  for (const [id, rows] of Object.entries(comm)) { const m = market(rows); if (m.qty) all.c[id] = [m.p, m.qty]; }
+  for (const [k, arr] of Object.entries(realmMin)) {
+    if (arr.length < 2) continue; // listed on a single realm: too thin to call a region price
+    const srt = arr.slice().sort((x, y) => x - y), med = median(arr.slice()), q25 = srt[Math.floor(srt.length * 0.25)];
+    (k[0] === 'p' ? all.p : all.r)[k.slice(1)] = [med > 3 * q25 ? q25 : med, arr.length];
+  }
+  return { realms: ok, items: out, all };
 }
 
 TOKEN = await token();
@@ -167,13 +175,44 @@ const ids = await readJson('data/retail-ids.json', {});
 await resolveNames(list, ids);
 await fs.writeFile('data/retail-ids.json', JSON.stringify(ids));
 
+// item names for the live AH search (cached in data/retail-names.json; new ids looked up in id-ordered pages of 1000)
+const NEED = new Set();
+async function resolveAllNames(names, budget = 400) {
+  const miss = [...NEED].filter(id => !(id in names.i)).map(Number).sort((a, b) => a - b);
+  let k = 0, calls = 0;
+  while (k < miss.length && calls < budget) {
+    const start = miss[k];
+    const j = await api('eu', '/data/wow/search/item', 'static-eu', `&id=[${start},]&orderby=id&_pageSize=1000&_page=1`);
+    calls++;
+    if (j === undefined) break;
+    if (!j || !j.results || !j.results.length) { for (; k < miss.length; k++) names.i[miss[k]] = ''; break; }
+    let last = start;
+    for (const r of j.results) { names.i[r.data.id] = nameOf(r.data.name); if (r.data.id > last) last = r.data.id; }
+    while (k < miss.length && miss[k] <= last) { if (!(miss[k] in names.i)) names.i[miss[k]] = ''; k++; }
+    await sleep(30);
+  }
+  const pj = await api('eu', '/data/wow/pet/index', 'static-eu');
+  for (const p of (pj && pj.pets) || []) names.p[p.id] = nameOf(p.name);
+  console.log('names: looked up', calls, 'pages,', miss.length - k, 'ids still unnamed');
+}
+
 for (const region of REGIONS) {
   try {
     const r = await collectRegion(region, list, ids);
     if (!Object.keys(r.items).length) throw new Error('no prices collected');
     await fs.writeFile(`data/retail-${region}.json`, JSON.stringify({ game: 'retail', region, updated: new Date().toISOString(), realms: r.realms, items: r.items }));
+    await fs.writeFile(`data/retail-${region}-all.json`, JSON.stringify({ game: 'retail', region, updated: new Date().toISOString(), realms: r.realms, ...r.all }));
+    for (const id of Object.keys(r.all.c)) NEED.add(id);
+    for (const id of Object.keys(r.all.r)) NEED.add(id);
+    console.log(region, 'all items:', Object.keys(r.all.c).length, 'commodities,', Object.keys(r.all.r).length, 'realm items,', Object.keys(r.all.p).length, 'pets');
     console.log(region, 'priced items:', Object.keys(r.items).length);
   } catch (e) {
     console.error(region, 'FAILED:', e.message); // keep the previous file so the site shows the last good prices
   }
 }
+
+try {
+  const names = await readJson('data/retail-names.json', { i: {}, p: {} });
+  await resolveAllNames(names);
+  await fs.writeFile('data/retail-names.json', JSON.stringify(names));
+} catch (e) { console.error('names FAILED:', e.message); }
