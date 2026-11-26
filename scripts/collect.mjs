@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 const REGIONS = (process.env.REGIONS || 'eu,us').split(',');
 const ID = process.env.BLIZZ_ID, SECRET = process.env.BLIZZ_SECRET;
 const MAX_NAME_LOOKUPS = 1500;          // new item names to resolve per run (per region), busiest items first
+const MAX_SELL_LOOKUPS = 1500;          // vendor sell prices to backfill per run (per region)
 const HISTORY_DAYS = 45;
 if (!ID || !SECRET) { console.error('Missing BLIZZ_ID / BLIZZ_SECRET'); process.exit(1); }
 
@@ -65,7 +66,7 @@ function stats(list) {
   return { min: list[0][0], mkt: Math.round(sq ? sv / sq : list[0][0]), med: at(0.5), qty, n: list.length };
 }
 
-async function collectRegion(region, names) {
+async function collectRegion(region, names, sells = {}) {
   const ns = `dynamic-forever-${region}`;
   const idx = await api(region, '/data/wow/ruleset/index', ns);
   const rulesets = (idx && idx.rulesets) || [];
@@ -117,6 +118,15 @@ async function collectRegion(region, names) {
     if (!j) j = await api(region, `/data/wow/item/${id}`, `static-classic1x-${region}`);
     const nm = j && (typeof j.name === 'string' ? j.name : (j.name?.en_GB || j.name?.en_US));
     names[id] = nm || '';
+    if (j && j.sell_price != null) sells[id] = j.sell_price;
+    await sleep(15);
+  }
+  // Backfill vendor sell prices for items we already know (used by the AH Deal Finder)
+  const needSell = Object.keys(names).filter(id => !(id in sells)).slice(0, MAX_SELL_LOOKUPS);
+  for (const id of needSell) {
+    let j = await api(region, `/data/wow/item/${id}`, `static-forever-${region}`);
+    if (!j) j = await api(region, `/data/wow/item/${id}`, `static-classic1x-${region}`);
+    sells[id] = j && j.sell_price != null ? j.sell_price : 0;
     await sleep(15);
   }
 
@@ -147,11 +157,12 @@ async function collectRegion(region, names) {
 async function main() {
   TOKEN = await token();
   const names = await readJson('data/item-names.json', {});
+  const sells = await readJson('data/item-sell.json', {});
   const now = new Date();
   const day = now.toISOString().slice(0, 10);
   for (const region of REGIONS) {
     try {
-      const r = await collectRegion(region, names);
+      const r = await collectRegion(region, names, sells);
       const index = [];
       for (const [rid, its] of Object.entries(r.rulesets)) {
         if (!Object.keys(its).length) continue;
@@ -184,6 +195,7 @@ async function main() {
     }
   }
   await fs.writeFile('data/item-names.json', JSON.stringify(names));
+  await fs.writeFile('data/item-sell.json', JSON.stringify(sells));
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
