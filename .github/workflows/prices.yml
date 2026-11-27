@@ -1,7 +1,9 @@
 name: Collect prices
 on:
   schedule:
-    - cron: '23 * * * *'
+    # GitHub's timer often runs late or skips, so try four times an hour;
+    # the "fresh" step skips the run if prices are under 45 minutes old.
+    - cron: '8,23,38,53 * * * *'
   workflow_dispatch:
 permissions:
   contents: write
@@ -14,16 +16,25 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Skip if prices are fresh
+        id: fresh
+        if: github.event_name == 'schedule'
+        run: |
+          age=$(node -e "try{console.log(Math.floor((Date.now()-Date.parse(require('./data/forever-eu-index.json').updated))/60000))}catch(e){console.log(999)}")
+          echo "Prices are $age minutes old"
+          if [ "$age" -lt 45 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
       - uses: actions/setup-node@v4
+        if: steps.fresh.outputs.skip != 'true'
         with:
           node-version: 22
       - name: Collect WoW Forever prices
+        if: steps.fresh.outputs.skip != 'true'
         env:
           BLIZZ_ID: ${{ secrets.BLIZZ_ID }}
           BLIZZ_SECRET: ${{ secrets.BLIZZ_SECRET }}
         run: node scripts/collect.mjs
       - name: Save data
-        if: always()
+        if: always() && steps.fresh.outputs.skip != 'true'
         run: |
           git config user.name "gaminghero-prices-bot"
           git config user.email "actions@users.noreply.github.com"
